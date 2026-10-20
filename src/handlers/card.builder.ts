@@ -8,6 +8,7 @@
 import { AutotaskService } from '../services/autotask.service.js';
 import { PicklistCache } from '../services/picklist.cache.js';
 import { Logger } from '../utils/logger.js';
+import { vendorStatus } from '../utils/vendor-error.js';
 
 export const TICKET_CARD_RESOURCE_URI = 'ui://autotask/ticket-card.html';
 
@@ -95,6 +96,7 @@ export async function buildTicketCard(
   picklists: PicklistCache,
   service: AutotaskService,
   logger: Logger,
+  prefetchedNotes?: RecentTicketNotes,
 ): Promise<TicketCard | null> {
   if (typeof ticket?.id !== 'number' || !ticket.ticketNumber || !ticket.title) {
     return null;
@@ -121,23 +123,54 @@ export async function buildTicketCard(
   if (queue) card.queue = queue;
 
   // Recent notes give the card (and its add-note round-trip) visible context.
-  try {
-    const notes = await service.searchTicketNotes(ticket.id, { pageSize: CARD_NOTE_LIMIT });
-    card.notes = notes.slice(0, CARD_NOTE_LIMIT).map((n) => {
-      const note: TicketCard['notes'][number] = {
-        description: String(n.description ?? '').slice(0, CARD_NOTE_MAX_LENGTH),
-      };
-      if (n.title) note.title = String(n.title);
-      return note;
-    });
-  } catch (error) {
-    logger.debug('Ticket card: note fetch failed, rendering without notes', error);
-  }
+  // A caller that already fetched them (the ticket-detail handler) passes
+  // them in so the notes are requested once.
+  card.notes = (prefetchedNotes ?? await fetchRecentTicketNotes(ticket.id, service, logger)).notes;
 
   const noteDefaults = await resolveNoteDefaults(picklists, logger);
   if (noteDefaults) card.noteDefaults = noteDefaults;
 
   return card;
+}
+
+/**
+ * Result of a recent-notes fetch. `unavailable` means the fetch failed, which
+ * is not the same as a ticket with no notes. `status` is the vendor HTTP
+ * status when the error carried one.
+ */
+export interface RecentTicketNotes {
+  notes: TicketCard['notes'];
+  unavailable?: { status?: number };
+}
+
+/**
+ * The ticket's most recent notes, trimmed for display. Best-effort: a failed
+ * fetch never throws. It logs a warning and returns `unavailable` so callers
+ * can say the notes couldn't be read rather than "none" (WYREAI-527).
+ */
+export async function fetchRecentTicketNotes(
+  ticketId: number,
+  service: AutotaskService,
+  logger: Logger,
+): Promise<RecentTicketNotes> {
+  try {
+    const notes = await service.searchTicketNotes(ticketId, { pageSize: CARD_NOTE_LIMIT });
+    return {
+      notes: notes.slice(0, CARD_NOTE_LIMIT).map((n) => {
+        const note: TicketCard['notes'][number] = {
+          description: String(n.description ?? '').slice(0, CARD_NOTE_MAX_LENGTH),
+        };
+        if (n.title) note.title = String(n.title);
+        return note;
+      }),
+    };
+  } catch (error) {
+    const status = vendorStatus(error);
+    logger.warn(
+      `Ticket ${ticketId} notes lookup failed${status !== undefined ? ` (HTTP ${status})` : ''}; returning the ticket without notes`,
+    );
+    return { notes: [], unavailable: status !== undefined ? { status } : {} };
+  }
 }
 
 async function picklistLabel(

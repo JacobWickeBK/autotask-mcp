@@ -10,7 +10,8 @@ import { formatCompactResponse, detectEntityType, COMPACT_SEARCH_TOOLS } from '.
 import { MappingService } from '../utils/mapping.service.js';
 import { mapWithConcurrency } from '../utils/concurrency.js';
 import { TOOL_DEFINITIONS, TOOL_CATEGORIES } from './tool.definitions.js';
-import { buildTicketCard, type TicketCard } from './card.builder.js';
+import { buildTicketCard, fetchRecentTicketNotes, type RecentTicketNotes, type TicketCard } from './card.builder.js';
+import { vendorStatus } from '../utils/vendor-error.js';
 import { buildTicketSearchParams } from './intent-router.js';
 
 // Default concurrency for company/resource name enrichment. Autotask allows
@@ -224,6 +225,52 @@ export class AutotaskToolHandler {
     } catch (error) {
       this.logger.debug('Enhancement failed, returning original items:', error);
       return items;
+    }
+  }
+
+  /**
+   * Best-effort lookup of a ticket's linked configuration item, reduced to the
+   * fields that identify it. Returns null (never throws) on any failure.
+   */
+  private async resolveLinkedConfigurationItem(id: number): Promise<Record<string, unknown> | null> {
+    try {
+      const ci = await this.autotaskService.getConfigurationItem(id);
+      if (!ci) return null;
+      const linked: Record<string, unknown> = { id };
+      for (const field of LINKED_CI_FIELDS) {
+        if (ci[field] !== undefined && ci[field] !== null && ci[field] !== '') linked[field] = ci[field];
+      }
+      return linked;
+    } catch (error) {
+      // Nonfatal: the ticket still returns, with the CI shown by ID only.
+      const status = vendorStatus(error);
+      this.logger.warn(
+        `Linked configuration item ${id} lookup failed${status !== undefined ? ` (HTTP ${status})` : ''}; returning the ticket with the CI ID only`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Best-effort lookup of a ticket's contact, reduced to name/email/phone.
+   * Returns null (never throws) on any failure.
+   */
+  private async resolveTicketContact(id: number): Promise<Record<string, unknown> | null> {
+    try {
+      const c = await this.autotaskService.getContact(id);
+      if (!c) return null;
+      const contact: Record<string, unknown> = { id };
+      const name = [c.firstName, c.lastName].filter(Boolean).join(' ').trim();
+      if (name) contact.name = name;
+      if (c.emailAddress) contact.emailAddress = c.emailAddress;
+      if (c.phone) contact.phone = c.phone;
+      return contact;
+    } catch (error) {
+      const status = vendorStatus(error);
+      this.logger.warn(
+        `Ticket contact ${id} lookup failed${status !== undefined ? ` (HTTP ${status})` : ''}; returning the ticket with the contact ID only`,
+      );
+      return null;
     }
   }
 
@@ -965,7 +1012,25 @@ export class AutotaskToolHandler {
         return { result: r, message: `Found ${r.length} tickets` };
       }],
       ['autotask_get_ticket_details', async (a) => {
-        const r = await s.getTicket(a.ticketID, a.fullDetails); return { result: r, message: 'Ticket details retrieved successfully' };
+        const r = await s.getTicket(a.ticketID, a.fullDetails);
+        // WYREAI-527: a ticket only carries configurationItemID, which tells
+        // the model nothing on its own. Resolve the linked CI (best-effort —
+        // a failed lookup must never fail the ticket fetch).
+        // The contact is resolved the same way so the model gets a name, not
+        // just contactID.
+        if (r) {
+          const [ci, contact] = await Promise.all([
+            typeof r.configurationItemID === 'number'
+              ? this.resolveLinkedConfigurationItem(r.configurationItemID)
+              : Promise.resolve(null),
+            typeof r.contactID === 'number'
+              ? this.resolveTicketContact(r.contactID)
+              : Promise.resolve(null),
+          ]);
+          if (ci) (r as Record<string, unknown>).configurationItem = ci;
+          if (contact) (r as Record<string, unknown>).contact = contact;
+        }
+        return { result: r, message: 'Ticket details retrieved successfully' };
       }],
       ['autotask_create_ticket', async (a) => {
         const payload = buildTicketPayload(a);
@@ -1763,21 +1828,23 @@ export class AutotaskToolHandler {
         const data = enhanced[0] || result;
         // MCP Apps: attach the normalized card payload the ui:// ticket card
         // renders from. Best-effort — a null card just means no UI surface.
-        let card: TicketCard | null = null;
         if (name === 'autotask_get_ticket_details') {
-          card = await buildTicketCard(data, this.picklistCache, this.autotaskService, this.logger);
+          // WYREAI-527: the model only sees `content`, not structuredContent,
+          // so the text must carry the ticket itself (description, linked CI,
+          // dates, people, notes), whether or not a card could be built.
+          // Notes are fetched once here and shared with the card.
+          const recentNotes: RecentTicketNotes = typeof data.id === 'number'
+            ? await fetchRecentTicketNotes(data.id, this.autotaskService, this.logger)
+            : { notes: [] };
+          const card = await buildTicketCard(data, this.picklistCache, this.autotaskService, this.logger, recentNotes);
           if (card) data._card = card;
-        }
-        this.logger.debug(`Successfully executed tool: ${name}`);
-        if (card) {
+          this.logger.debug(`Successfully executed tool: ${name}`);
           return {
-            content: [{
-              type: 'text',
-              text: `Ticket ${card.ticketNumber ?? card.id}: ${card.title} (${card.priority}, ${card.status})`,
-            }],
+            content: [{ type: 'text', text: formatTicketDetailsText(data, card, recentNotes) }],
             structuredContent: { message, data },
           };
         }
+        this.logger.debug(`Successfully executed tool: ${name}`);
         responseText = JSON.stringify({ message, data });
       } else {
         responseText = JSON.stringify({ message, data: result });
@@ -1806,6 +1873,126 @@ export class AutotaskToolHandler {
       });
     }
   }
+}
+
+/** Configuration item fields surfaced on a ticket's `configurationItem`. */
+const LINKED_CI_FIELDS = [
+  'referenceTitle',
+  'referenceNumber',
+  'serialNumber',
+  'configurationItemName',
+  'configurationItemType',
+  'productID',
+  'companyID',
+  'isActive',
+] as const;
+
+function formatContact(data: Record<string, any>): string {
+  const c = data.contact as Record<string, any> | undefined;
+  if (!c || !c.name) return `ID ${data.contactID}`;
+  const extras = [`ID ${data.contactID}`, c.emailAddress, c.phone].filter(Boolean).join(', ');
+  return `${c.name} (${extras})`;
+}
+
+/**
+ * Model-facing text for autotask_get_ticket_details (WYREAI-527).
+ *
+ * MCP clients hand the model `content`, not `structuredContent`, so this text
+ * has to carry the ticket: a readable header (title, status, priority, queue,
+ * company, assignee, dates, linked CI, description, resolution, recent notes)
+ * followed by the full ticket record as JSON so no fetched field — including
+ * UDFs when fullDetails is true — is hidden from the model. The `_card` UI
+ * payload is omitted from the JSON; its useful parts are in the header.
+ */
+export function formatTicketDetailsText(
+  data: Record<string, any>,
+  card: TicketCard | null,
+  recentNotes: RecentTicketNotes = { notes: card?.notes ?? [] },
+): string {
+  const notes = recentNotes.notes;
+  const lines: string[] = [];
+  const id = card?.id ?? data.id;
+  const ticketNumber = card?.ticketNumber ?? data.ticketNumber;
+  const title = card?.title ?? data.title;
+  lines.push(`Ticket ${ticketNumber ?? id ?? '(unknown)'}: ${title ?? '(no title)'}`);
+  if (id != null) lines.push(`Ticket ID: ${id}`);
+
+  // Without a card the picklist labels are unresolved, so show the raw IDs.
+  const join = (parts: Array<string | undefined>) => parts.filter(Boolean).join(' | ');
+  const label = (resolved: string | undefined, raw: unknown) =>
+    resolved ?? (raw != null ? `#${raw}` : undefined);
+  const status = label(card?.status, data.status);
+  const priority = label(card?.priority, data.priority);
+  const queue = label(card?.queue, data.queueID);
+  const statusLine = join([
+    status ? `Status: ${status}` : undefined,
+    priority ? `Priority: ${priority}` : undefined,
+    queue ? `Queue: ${queue}` : undefined,
+  ]);
+  if (statusLine) lines.push(statusLine);
+
+  const company = typeof data.company === 'string'
+    ? `${data.company}${data.companyID != null ? ` (ID ${data.companyID})` : ''}`
+    : data.companyID != null ? `ID ${data.companyID}` : undefined;
+  const peopleLine = join([
+    company ? `Company: ${company}` : undefined,
+    data.contactID != null ? `Contact: ${formatContact(data)}` : undefined,
+    typeof data.assignedTo === 'string'
+      ? `Assigned to: ${data.assignedTo}`
+      : data.assignedResourceID != null ? `Assigned resource ID: ${data.assignedResourceID}` : undefined,
+  ]);
+  if (peopleLine) lines.push(peopleLine);
+
+  const dateLine = join([
+    data.createDate ? `Created: ${data.createDate}` : undefined,
+    data.dueDateTime ? `Due: ${data.dueDateTime}` : undefined,
+    data.lastActivityDate ? `Last activity: ${data.lastActivityDate}` : undefined,
+    data.completedDate ? `Completed: ${data.completedDate}` : undefined,
+  ]);
+  if (dateLine) lines.push(dateLine);
+
+  if (data.configurationItemID != null) {
+    const ci = data.configurationItem as Record<string, any> | undefined;
+    const name = ci?.referenceTitle ?? ci?.configurationItemName;
+    const extras = join([
+      `ID ${data.configurationItemID}`,
+      ci?.referenceNumber ? `reference ${ci.referenceNumber}` : undefined,
+      ci?.serialNumber ? `serial ${ci.serialNumber}` : undefined,
+    ]);
+    lines.push(`Configuration item: ${name ? `${name} (${extras})` : extras}`);
+  } else {
+    lines.push('Configuration item: none linked');
+  }
+
+  lines.push('', 'Description:', data.description ? String(data.description) : '(no description)');
+  if (data.resolution) lines.push('', 'Resolution:', String(data.resolution));
+
+  const udfs = Array.isArray(data.userDefinedFields)
+    ? data.userDefinedFields.filter((u: any) => u && u.name && u.value !== undefined && u.value !== null && String(u.value).trim() !== '')
+    : [];
+  if (udfs.length > 0) {
+    lines.push('', `Custom fields (UDFs, ${udfs.length} with values):`);
+    for (const u of udfs) lines.push(`- ${u.name}: ${String(u.value)}`);
+  } else {
+    lines.push('', 'Custom fields (UDFs): none with values');
+  }
+
+  if (notes.length > 0) {
+    lines.push('', `Recent notes (${notes.length}, newest Autotask returned):`);
+    for (const note of notes) {
+      lines.push(`- ${note.title ? `${note.title}: ` : ''}${note.description}`);
+    }
+  } else if (recentNotes.unavailable) {
+    // A failed fetch is not "no notes": say so, with the vendor status.
+    const status = recentNotes.unavailable.status;
+    lines.push('', `Recent notes: unavailable (the Autotask notes lookup failed${status !== undefined ? ` with HTTP ${status}` : ''}; the ticket may still have notes)`);
+  } else {
+    lines.push('', 'Recent notes: none');
+  }
+
+  const { _card: _omit, ...record } = data;
+  lines.push('', 'Full ticket record (JSON):', JSON.stringify(record));
+  return lines.join('\n');
 }
 
 /**
